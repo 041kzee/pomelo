@@ -1,4 +1,3 @@
-const { connectDB } = require('../helpers/dbCon');
 const { escapeRegex } = require('../utils/escapeRegex');
 const Question = require('../models/Question');
 const Contest = require('../models/Contest');
@@ -46,7 +45,6 @@ exports._hasUnsafeKeys = hasUnsafeKeys;
 
 exports.getData = async (req, res, next) => {
     try {
-        await connectDB();
 
         const { collection, filter = {}, projection = null, limit = 0, sort = {}, populate = null, skip = 0, count = false, search = null } = req.body;
 
@@ -65,7 +63,8 @@ exports.getData = async (req, res, next) => {
         if (sort !== null && !isPlainObject(sort)) {
             return res.status(400).json({ success: false, error: "Invalid sort" });
         }
-        if (populate !== null && !(typeof populate === 'string' || Array.isArray(populate) || isPlainObject(populate))) {
+        // Plain paths only: an object could carry `select: '+passwordHash'` past the schema's select:false.
+        if (populate !== null && !(typeof populate === 'string' || (Array.isArray(populate) && populate.every((p) => typeof p === 'string')))) {
             return res.status(400).json({ success: false, error: "Invalid populate" });
         }
         if (search !== null && typeof search !== 'string') {
@@ -87,8 +86,9 @@ exports.getData = async (req, res, next) => {
 
         const skipCount = Math.max(0, Math.floor(Number(skip)) || 0);
 
-        // Build query
-        let query = Model.find(effectiveFilter, projection);
+        // Build query. lean(): the result is only serialised, and hydrating every
+        // document costs a lot of CPU on the API's single event loop.
+        let query = Model.find(effectiveFilter, projection).lean();
 
         if (sort) query = query.sort(sort);
         if (skipCount) query = query.skip(skipCount);
@@ -109,7 +109,6 @@ exports.getData = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
     try {
-        await connectDB();
 
         const { collection, filter = {}, projection = null, populate = null } = req.body;
 
@@ -125,7 +124,8 @@ exports.getOne = async (req, res, next) => {
         if (projection !== null && !isPlainObject(projection)) {
             return res.status(400).json({ success: false, error: "Invalid projection" });
         }
-        if (populate !== null && !(typeof populate === 'string' || Array.isArray(populate) || isPlainObject(populate))) {
+        // Plain paths only: an object could carry `select: '+passwordHash'` past the schema's select:false.
+        if (populate !== null && !(typeof populate === 'string' || (Array.isArray(populate) && populate.every((p) => typeof p === 'string')))) {
             return res.status(400).json({ success: false, error: "Invalid populate" });
         }
 
@@ -133,7 +133,7 @@ exports.getOne = async (req, res, next) => {
             return res.status(400).json({ success: false, error: "Unsafe query keys detected" });
         }
 
-        let query = Model.findOne(filter, projection);
+        let query = Model.findOne(filter, projection).lean();
         if (populate) query = query.populate(populate);
 
         const data = await query.exec();

@@ -41,13 +41,11 @@ const contestSchema = new mongoose.Schema({
     type: String,
     enum: ['upcoming', 'ongoing', 'completed', 'ended'],
   },
-
-  violations: [{
-    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    timestamp: { type: Date, default: Date.now },
-    details: String,
-  }],
-
+  // Each candidate sees the questions in their own fixed order (utils/questionOrder.js).
+  shuffleQuestions: {
+    type: Boolean,
+    default: false,
+  },
 }, { timestamps: true });
 
 // Every write drops the cached copy here rather than at each call site, so no

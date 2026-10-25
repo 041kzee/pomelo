@@ -1,7 +1,8 @@
 
 import type { NextAuthConfig } from "next-auth"
-import { SignJWT } from "jose"
+import { SignJWT, decodeJwt } from "jose"
 import { getBaseUrl } from "@/lib/env";
+import { clientIpHeaders } from "@/lib/client-ip";
 import { getEnabledProviders, getProviderEntry } from "@/lib/auth/providers";
 
 // Helper to mint a token for the Express Request
@@ -67,7 +68,7 @@ export const authConfig = {
             try {
                 const res = await fetch(`${getBaseUrl()}/api/auth/oauth/${entry.id}`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', ...(await clientIpHeaders()) },
                     body: JSON.stringify(entry.toBackendPayload(account))
                 });
                 const data = await res.json().catch(() => ({}));
@@ -102,14 +103,24 @@ export const authConfig = {
             const isAdminPage = nextUrl.pathname.startsWith('/admin');
             const isUserPage = ['/attempt', '/join', '/test'].some(path => nextUrl.pathname.startsWith(path));
 
+            // Auth.js's own redirect puts an absolute URL built from AUTH_URL in callbackUrl,
+            // whose host can differ from the browser's; a path always round-trips.
+            const toLogin = () => {
+                const login = nextUrl.clone();
+                login.pathname = '/auth/login';
+                login.search = '';
+                login.searchParams.set('callbackUrl', `${nextUrl.pathname}${nextUrl.search}`);
+                return Response.redirect(login);
+            };
+
             if (isAdminPage) {
                 if (isLoggedIn && userRole === 'admin') return true;
-                return false; // Redirect to login
+                return toLogin();
             }
 
             if (isUserPage) {
                 if (isLoggedIn) return true;
-                return false; // Redirect to login
+                return toLogin();
             }
 
             return true;
@@ -118,7 +129,8 @@ export const authConfig = {
             if (user) {
                 const u = user as User;
                 token.role = u.role
-                token.id = u.id || u._id
+                // _id first: for credentials sign-ins Auth.js fills `id` with a random UUID.
+                token.id = String(u._id || u.id)
                 token.email = u.email
 
                 // Mint a fresh backend token — if this fails, sign-in must fail too,
@@ -139,8 +151,10 @@ export const authConfig = {
             // session can renew its short-lived backend token.
             if (token.id && shouldRefreshBackendToken(token.backendTokenExp, Math.floor(Date.now() / 1000))) {
                 try {
+                    // The user id comes from the backend token minted at sign-in, which is the
+                    // database id even for sessions whose token.id predates the fix above.
                     const minted = await mintBackendToken({
-                        id: token.id as string,
+                        id: String(decodeJwt(token.backendToken as string).userId ?? token.id),
                         role: token.role as string,
                         email: token.email as string,
                     });

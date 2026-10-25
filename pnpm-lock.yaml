@@ -91,6 +91,9 @@ importers:
       '@monaco-editor/react':
         specifier: ^4.7.0
         version: 4.7.0(monaco-editor@0.55.1)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
+      '@next/env':
+        specifier: 16.2.6
+        version: 16.2.6
       '@pomelo/code-gen':
         specifier: workspace:*
         version: link:../packages/code-gen
@@ -181,6 +184,9 @@ importers:
       lucide-react:
         specifier: ^1.17.0
         version: 1.17.0(react@19.2.6)
+      monaco-editor:
+        specifier: 0.55.1
+        version: 0.55.1
       motion:
         specifier: ^12.40.0
         version: 12.40.0(react-dom@19.2.6(react@19.2.6))(react@19.2.6)

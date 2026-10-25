@@ -7,7 +7,7 @@ import { Problem } from "@/types/problem";
 import { auth } from "@/auth";
 import { redirect } from "next/navigation";
 import React from "react";
-import { getBaseUrl } from "@/lib/env";
+import { fetchBackend } from "@/lib/fetch";
 import { DISABLE_PROCTORING } from "@/lib/attempt-integrity";
 import { cn } from "@/lib/utils";
 
@@ -32,22 +32,14 @@ export default async function TestLayout({
   const { testid } = await params;
   const session = await auth();
 
-  const res = await fetch(`${getBaseUrl()}/api/test/${testid}/data`, {
-    headers: {
-      "Authorization": `Bearer ${session?.backendToken}`,
-      "Content-Type": "application/json"
-    },
-    cache: "no-store"
-  });
-
-  const result = await res.json();
+  const result = await fetchBackend(`/api/test/${testid}/data`);
 
   /*
    * SECURITY CHECK:
    * If the user has completed the test, the middleware returns 403.
    * We must redirect them out of the attempt area immediately.
    */
-  if (!res.ok || !result.success || result.isCompleted) {
+  if (!result.success || result.isCompleted) {
     redirect(`/test/${testid}`);
   }
 
@@ -67,7 +59,7 @@ export default async function TestLayout({
 
   return (
     <main className="w-screen h-screen pt-12 flex">
-      <ContestAttemptRuntime contestId={testid} initialProgress={initialProgress}>
+      <ContestAttemptRuntime contestId={testid} userId={session?.user?.id} initialProgress={initialProgress}>
         <IntegrityMonitor />
         <TestHeader initialTimeRemaining={initialTimeRemaining} />
         <QuestionNav problems={problemMeta} />

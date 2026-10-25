@@ -1,17 +1,22 @@
 const Contest = require('../models/Contest');
 const Submission = require('../models/Submissions');
-const { connectDB } = require('../helpers/dbCon');
 const { buildScoreCSV, buildSubmissionsDump, generateResultsFilename } = require('../utils/resultsIO/export');
+const { finalizeExpiredAttempts } = require('../utils/expireAttempts');
 
-async function loadContestAndSubmissions(id) {
+// fields: optional projection, so the score sheet doesn't load every candidate's code
+// and test results.
+async function loadContestAndSubmissions(id, fields) {
     const contest = await Contest.findById(id)
-        .select('title questions._id questions.title questions.marks questions.questionType')
+        .select('title durationMinutes questions._id questions.title questions.marks questions.questionType')
         .lean();
     if (!contest) {
         return { contest: null, submissions: [] };
     }
+    // Exports must include candidates whose time ran out without a submit.
+    await finalizeExpiredAttempts(contest);
 
     const submissions = await Submission.find({ contest: id, status: 'Completed' })
+        .select(fields)
         .populate('user', 'name email')
         .lean();
 
@@ -30,10 +35,9 @@ async function loadContestAndSubmissions(id) {
 // @desc Export a contest's candidate scores as a CSV score sheet
 const exportScores = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
-        const { contest, submissions } = await loadContestAndSubmissions(id);
+        const { contest, submissions } = await loadContestAndSubmissions(id, 'user totalScore submissions.question submissions.score');
         if (!contest) {
             return res.status(404).json({ success: false, error: 'Contest not found' });
         }
@@ -60,7 +64,6 @@ const exportScores = async (req, res, next) => {
 // @desc Export a contest's full submission data as a JSON dump (compact or verbose)
 const exportSubmissions = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
         const verbose = req.query.verbose === 'true';
 

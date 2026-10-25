@@ -3,6 +3,9 @@ const User = require('../models/User');
 const Submission = require('../models/Submissions');
 const { z } = require('zod');
 const { toProblemView } = require('../utils/toProblemView');
+const { isManuallyEnded, attemptDeadline, lastDeadline } = require('../utils/contestTime');
+const { orderQuestionsFor } = require('../utils/questionOrder');
+const { finalizeExpiredAttempts } = require('../utils/expireAttempts');
 
 // Stands in for "no submittedAt" so Ongoing entries sort last, matching the
 // Infinity the old in-memory comparator used.
@@ -18,7 +21,7 @@ const validateJoinId = async (req, res, next) => {
         if (typeof joinId !== 'string' || !/^\d{6}$/.test(joinId.trim())) {
             return res.status(400).json({
                 success: false,
-                message: "Join ID must be a 6-digit code."
+                error: "Join ID must be a 6-digit code."
             });
         }
 
@@ -28,7 +31,7 @@ const validateJoinId = async (req, res, next) => {
         if (!contest) {
             return res.status(404).json({
                 success: false,
-                message: "Invalid Join ID. No test found with this code."
+                error: "Invalid Join ID. No test found with this code."
             });
         }
 
@@ -43,78 +46,13 @@ const validateJoinId = async (req, res, next) => {
     }
 };
 
-// @desc    Manage violations in a contest
-// @route   POST /api/contests/:id/violation
-// @access  Private (requires authentication)
-const manageViolations = async (req, res, next) => {
-    try {
-        const { userId, details } = req.body;
-        const contest = await Contest.findById(req.params.id);
-
-        if (!contest) {
-            return res.status(404).json({ message: 'Contest not found' });
-        }
-
-        const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({ message: 'User not found' });
-        }
-
-        // Add violation logic here
-        // For example, adding to a violations array in the contest model
-        const violation = {
-            user: userId,
-            timestamp: new Date(),
-            details: details || ' details provided.'
-        };
-
-        // Assuming contest schema has a 'violations' array
-        if (!contest.violations) {
-            contest.violations = [];
-        }
-        contest.violations.push(violation);
-
-        await contest.save();
-
-        res.json({ message: 'Violation recorded successfully', violation });
-    } catch (error) {
-        next(error);
-    }
-};
-
-// @desc    Check if test ID is valid
-const checkTestId = async (req, res) => {
-    try {
-        const { contestId } = req.body;
-        const contest = await Contest.findById(contestId);
-
-        if (!contest) {
-            return res.json({ isValid: false });
-        }
-
-        return res.json({
-            isValid: true,
-            contestInfo: {
-                title: contest.title,
-                description: contest.description
-            }
-        });
-    } catch (error) {
-        return res.json({ isValid: false });
-    }
-};
-
 // @desc    Get contest landing details
 const getContestLanding = async (req, res, next) => {
     try {
         const contest = req.contest;
         const now = new Date();
         const start = new Date(contest.startTime);
-        // Check if contest is manually marked as Completed/Ended
-        const status = contest.status ? contest.status.toLowerCase() : '';
-        const isManuallyEnded = status === 'completed' || status === 'ended';
-
-        const canStart = now >= start && now <= new Date(contest.endTime) && !isManuallyEnded;
+        const canStart = now >= start && now <= new Date(contest.endTime) && !isManuallyEnded(contest);
 
         return res.json({
             success: true,
@@ -126,7 +64,7 @@ const getContestLanding = async (req, res, next) => {
                 endTime: contest.endTime,
                 serverTime: now,
                 canStart: canStart,
-                isEnded: isManuallyEnded || now > new Date(contest.endTime), // Pass ended status
+                isEnded: isManuallyEnded(contest) || now > new Date(contest.endTime), // Pass ended status
                 totalProblems: contest.questions.length,
                 author: contest.author || "SCEM Coding Club",
                 rules: contest.rules || []
@@ -142,10 +80,10 @@ const getContestData = async (req, res, next) => {
     try {
         const contest = req.contest;
 
-        const questions = contest.questions || [];
+        // In the candidate's own order when the test shuffles questions.
+        const questions = orderQuestionsFor(contest, req.user.id);
 
         // Fetch User Submission to get saved state
-        const Submission = require('../models/Submissions');
         // Middleware likely attached submission
         const submission = req.submission || await Submission.findOne({ contest: contest._id, user: req.user.id });
 
@@ -155,16 +93,16 @@ const getContestData = async (req, res, next) => {
                 if (s.question) {
                     answerMap[s.question.toString()] = {
                         answer: s.answer,
-                        code: s.code,
-                        language: s.language
+                        // Latest code, not the best-scoring copy, so a reload never
+                        // replaces what the candidate was last working on.
+                        code: s.lastCode ?? s.code,
+                        language: s.lastLanguage ?? s.language
                     };
                 }
             });
         }
 
-        const deadline = submission
-            ? new Date(submission.startedAt.getTime() + (contest.durationMinutes || 0) * 60000)
-            : new Date(contest.endTime);
+        const deadline = submission ? attemptDeadline(contest, submission) : new Date(contest.endTime);
         const timeRemaining = Math.max(0, (deadline - new Date()) / 1000);
 
         // Optional ?qid= trims every other question down to {id, type} —
@@ -195,43 +133,31 @@ const getContestData = async (req, res, next) => {
 // @desc    Start test (User Attempt)
 const startTest = async (req, res, next) => {
     try {
-        console.log("StartTest: Initiated");
         const contest = req.contest;
-        const userId = req.user.id || req.user._id || req.user.sub;
-        console.log("StartTest: User ID:", userId);
+        const userId = req.user.id;
 
         const contestId = contest._id;
-        console.log("StartTest: Contest ID:", contestId);
 
         const now = new Date();
 
         const user = await User.findById(userId);
         if (user && !user.registeredContests.includes(contestId)) {
-            console.log("StartTest: Registering user for contest");
             user.registeredContests.push(contestId);
             await user.save();
         }
 
-        // Initialize Submission if not exists
-        const Submission = require('../models/Submissions');
-        // Middleware might have attached submission
-        let submission = req.submission;
+        // Upsert, so two concurrent starts (double click, two tabs) share one attempt instead
+        // of the second failing on the unique index. A Completed attempt never gets here:
+        // the middleware's checkAttemptStatus already rejected it.
+        const { value: submission, lastErrorObject } = await Submission.findOneAndUpdate(
+            { contest: contestId, user: userId },
+            { $setOnInsert: { status: 'Ongoing', startedAt: now } },
+            { upsert: true, returnDocument: 'after', includeResultMetadata: true }
+        );
+        // The client keeps this browser's proctoring state when an attempt is resumed.
+        const resumed = !lastErrorObject?.upserted;
 
-        if (!submission) {
-            submission = await Submission.findOne({ contest: contestId, user: userId });
-        }
-
-        if (!submission) {
-            console.log("StartTest: Creating new submission");
-            submission = new Submission({ contest: contestId, user: userId, status: 'Ongoing' });
-            await submission.save();
-            console.log("StartTest: Submission created:", submission._id);
-        } else {
-            // Middleware already checked if it was Completed and threw 403 if checkAttemptStatus was set
-            console.log("StartTest: Resuming existing submission:", submission._id);
-        }
-
-        const deadline = new Date(submission.startedAt.getTime() + (contest.durationMinutes || 0) * 60000);
+        const deadline = attemptDeadline(contest, submission);
 
         return res.json({
             success: true,
@@ -239,6 +165,7 @@ const startTest = async (req, res, next) => {
             data: {
                 contestId: contest._id,
                 title: contest.title,
+                resumed,
                 timeRemaining: Math.max(0, Math.floor((deadline - now) / 1000))
             }
         });
@@ -256,25 +183,23 @@ const getLeaderboard = async (req, res, next) => {
             .select('title endTime durationMinutes status questions.marks')
             .lean();
         if (!contest) {
-            return res.status(404).json({ success: false, message: 'Contest not found' });
+            return res.status(404).json({ success: false, error: 'Contest not found' });
         }
+        // Results must count candidates whose time ran out without a submit.
+        await finalizeExpiredAttempts(contest);
 
         const now = new Date();
         // A late joiner may still legitimately be attempting past endTime,
         // so wait for the last possible personal deadline before unlocking.
-        const lastPossibleDeadline = new Date(new Date(contest.endTime).getTime() + (contest.durationMinutes || 0) * 60000);
-        const isEnded =
-            now > lastPossibleDeadline ||
-            ['completed', 'ended'].includes((contest.status || '').toLowerCase());
+        const isEnded = now > lastDeadline(contest) || isManuallyEnded(contest);
 
         if (!isEnded) {
             return res.status(403).json({
                 success: false,
-                message: 'Leaderboard is not available until the contest ends.'
+                error: 'Leaderboard is not available until the contest ends.'
             });
         }
 
-        const Submission = require('../models/Submissions');
 
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
@@ -340,48 +265,42 @@ const getLeaderboard = async (req, res, next) => {
 // @desc    End Test (Mark as Completed)
 const endTest = async (req, res, next) => {
     try {
-        console.log("EndTest: Initiated");
         const contestId = req.params.id || req.body.contestId || (req.contest && req.contest._id);
-        const userId = req.user.id || req.user._id || req.user.sub;
+        const userId = req.user.id;
         const { forcedSubmission = false, autoSubmitReason } = req.body || {};
-        console.log("EndTest: Contest ID:", contestId, "User ID:", userId);
 
         if (!contestId) {
-            console.log("EndTest: Missing Contest ID");
             return res.status(400).json({ success: false, error: 'Contest ID is required' });
         }
 
-        const Submission = require('../models/Submissions');
-        const submission = await Submission.findOne({ contest: contestId, user: userId });
+        const forced = Boolean(forcedSubmission || autoSubmitReason);
+        // Atomic and Ongoing-only, so a force-end or expiry that completes the attempt
+        // first is never overwritten (and repeated calls can't move submittedAt).
+        const completed = await Submission.findOneAndUpdate(
+            { contest: contestId, user: userId, status: 'Ongoing' },
+            { $set: {
+                status: 'Completed',
+                submittedAt: new Date(),
+                forcedSubmission: forced,
+                autoSubmitReason: forced ? autoSubmitReason || 'VIOLATION_LIMIT_REACHED' : undefined,
+            } },
+            { returnDocument: 'after' }
+        ).lean();
+        if (completed) {
+            return res.json({ success: true, message: 'Test completed successfully', forcedSubmission: completed.forcedSubmission });
+        }
+
+        const submission = await Submission.findOne({ contest: contestId, user: userId }).select('status forcedSubmission').lean();
 
         if (!submission) {
-            console.log("EndTest: Submission not found");
             return res.status(404).json({ success: false, error: 'Submission session not found. Did you start the test?' });
         }
 
-        // Submitting is one-time: the first end wins. Without this, a later call could
-        // move submittedAt forward, and one with an empty body would clear the
-        // forcedSubmission flag set by an integrity auto-submit.
-        if (submission.status === 'Completed') {
-            console.log("EndTest: Already completed, nothing to do");
-            return res.json({
-                success: true,
-                message: 'Test already submitted',
-                forcedSubmission: Boolean(submission.forcedSubmission)
-            });
-        }
-
-        console.log("EndTest: Marking submission as completed");
-        submission.status = 'Completed';
-        submission.submittedAt = new Date();
-        submission.forcedSubmission = Boolean(forcedSubmission || autoSubmitReason);
-        submission.autoSubmitReason = submission.forcedSubmission ? autoSubmitReason || 'VIOLATION_LIMIT_REACHED' : undefined;
-        await submission.save();
-
+        // Not Ongoing, so already Completed: submitting is one-time and the first end wins.
         return res.json({
             success: true,
-            message: 'Test completed successfully',
-            forcedSubmission: submission.forcedSubmission
+            message: 'Test already submitted',
+            forcedSubmission: Boolean(submission.forcedSubmission)
         });
     } catch (error) {
         next(error);
@@ -442,8 +361,6 @@ const submitFeedback = async (req, res, next) => {
 
 module.exports = {
     validateJoinId,
-    manageViolations,
-    checkTestId,
     getContestLanding,
     getContestData,
     startTest,

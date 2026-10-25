@@ -559,6 +559,7 @@ if [[ ! -s "$APP_ROOT/config/app.env" ]]; then
 
   AUTH_SECRET=$(gen_secret)
 
+  install -m 600 /dev/null "$APP_ROOT/config/app.env"
   cat > "$APP_ROOT/config/app.env" <<EOF
 # --- SECRETS & URIS ---
 AUTH_SECRET=${AUTH_SECRET}
@@ -570,6 +571,8 @@ EOF
 else
   log_info "Existing config preserved at ${DIM}$APP_ROOT/config/app.env${NC}"
 fi
+# Holds AUTH_SECRET: owner-only (also tightens installs created before this was set).
+chmod 600 "$APP_ROOT/config/app.env"
 
 if [[ ! -s "$APP_ROOT/config/config.yaml" ]]; then
   cat > "$APP_ROOT/config/config.yaml" <<YAML_EOF
@@ -602,7 +605,10 @@ fi
 # Copy default Citron config if not present
 if [[ ! -f "$APP_ROOT/config/citron.conf" ]] && [[ -f "$APP_ROOT/app/config/citron/citron.conf" ]]; then
   cp "$APP_ROOT/app/config/citron/citron.conf" "$APP_ROOT/config/citron.conf"
-  log_success "Default citron.conf installed"
+  # The shipped default of 2 concurrent runs is far below what a contest needs.
+  CPUS=$(nproc 2>/dev/null || echo 2)
+  sed -i -E "s/^(max_concurrent_submissions|execution_slots) = .*/\1 = ${CPUS}/" "$APP_ROOT/config/citron.conf"
+  log_success "Default citron.conf installed (${CPUS} execution slots)"
 fi
 
 if [[ ! -f "$APP_ROOT/config/languages.toml" ]] && [[ -f "$APP_ROOT/app/config/citron/languages.toml" ]]; then

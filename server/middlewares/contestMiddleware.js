@@ -2,6 +2,8 @@ const mongoose = require('mongoose');
 const Contest = require('../models/Contest');
 const Submission = require('../models/Submissions');
 const { getOrSet } = require('../utils/simpleCache');
+const { isManuallyEnded, attemptDeadline } = require('../utils/contestTime');
+const { finalizeExpiredAttempts } = require('../utils/expireAttempts');
 
 const CONTEST_TTL_MS = 60 * 60_000;
 
@@ -10,7 +12,7 @@ const CONTEST_TTL_MS = 60 * 60_000;
  * @param {Object} options Configuration options
  * @param {boolean} options.checkStarted - Verify if the contest has started
  * @param {boolean} options.checkEnded - Verify if the contest has ended
- * @param {boolean} options.checkRegistered - Verify if user is registered (requires auth middleware first)
+ * @param {boolean} options.requireAttempt - Require a started attempt (requires auth middleware first)
  * @param {string} options.checkAttemptStatus - 'NotCompleted' (blocks if completed)
  */
 const validateContest = (options = {}) => async (req, res, next) => {
@@ -41,16 +43,16 @@ const validateContest = (options = {}) => async (req, res, next) => {
             return res.status(403).json({ success: false, error: 'Contest has not started yet' });
         }
 
-        // Check if contest is manually marked as Completed/Ended or Time is up
-        const status = contest.status ? contest.status.toLowerCase() : '';
-        const isManuallyEnded = status === 'completed' || status === 'ended';
-
         // Fetch the user's submission once, shared by checkEnded (personal deadline)
         // and checkAttemptStatus below — avoids a duplicate query.
         let submission = null;
-        if ((options.checkEnded || options.checkAttemptStatus) && req.user) {
-            const userId = req.user.id || req.user._id || req.user.sub;
-            submission = await Submission.findOne({ contest: contest._id, user: userId });
+        if ((options.checkEnded || options.checkAttemptStatus || options.requireAttempt) && req.user) {
+            const userId = req.user.id;
+            // Runs on every attempt request: skip the bulky per-test-case results and
+            // don't hydrate, since every consumer only reads it.
+            submission = await Submission.findOne({ contest: contest._id, user: userId })
+                .select('-submissions.testCaseResults')
+                .lean();
         }
 
         if (options.checkEnded) {
@@ -67,26 +69,29 @@ const validateContest = (options = {}) => async (req, res, next) => {
             // deciding that late joiners should get a shortened attempt instead.
             const activeSubmission = submission && submission.status !== 'Completed' ? submission : null;
             const deadline = activeSubmission
-                ? new Date(activeSubmission.startedAt.getTime() + (contest.durationMinutes || 0) * 60000)
+                ? attemptDeadline(contest, activeSubmission)
                 : endTime;
 
             // A manual "End Test" blocks new/not-yet-started attempts but lets someone
             // already mid-attempt keep going until their own deadline — that's the
             // whole point of a "soft" end vs. force-ending (which completes every
             // Ongoing submission up front, so activeSubmission is null afterward).
-            if ((isManuallyEnded && !activeSubmission) || now > deadline) {
+            // The candidate's own time ran out without a submit (tab closed, network
+            // dropped): complete it now, so they see it as submitted, not resumable.
+            if (activeSubmission && now > deadline) {
+                await finalizeExpiredAttempts(contest, now);
+                return res.status(403).json({ success: false, isCompleted: true, error: 'Your time is up. The test has been submitted.' });
+            }
+
+            if ((isManuallyEnded(contest) && !activeSubmission) || now > deadline) {
                 return res.status(403).json({ success: false, error: 'Contest has ended' });
             }
         }
 
-        // Optional: Check registration if user is attached (auth middleware expected)
-        if (options.checkRegistered && req.user) {
-            const userId = req.user.id || req.user._id || req.user.sub;
-            // Assuming registeredContests is on user or we check submission/registration model
-            // For now, let's keep it simple or check the local user object if populated
-            // But usually registration check might be separate or part of the "start" logic
-            // We'll leave strict registration check to the controller or specific middleware if needed
-            // to avoid circular dependency or complex user fetching here if not already done.
+        // The per-user clock starts at /start; without this, questions could be read
+        // (and answered) before the timer runs.
+        if (options.requireAttempt && !submission) {
+            return res.status(403).json({ success: false, error: 'Start the test first' });
         }
 
         // Check Attempt Status

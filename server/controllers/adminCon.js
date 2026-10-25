@@ -2,7 +2,6 @@ const Question = require('../models/Question');
 const Contest = require('../models/Contest');
 const Submission = require('../models/Submissions');
 const { isValidObjectId } = require('mongoose');
-const { connectDB } = require('../helpers/dbCon');
 const { getJudge, validateProblemConfig } = require("@pomelo/code-gen");
 const {
   exportSingleQuestion,
@@ -13,6 +12,8 @@ const {
 } = require("../utils/questionsIO");
 const { escapeRegex } = require("../utils/escapeRegex");
 const { findQuestionsInOrder } = require("../utils/findQuestionsInOrder");
+const { ENDED_STATUSES, lastDeadline, contestStatus } = require("../utils/contestTime");
+const { finalizeExpiredAttempts } = require("../utils/expireAttempts");
 
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
 const toNumber = (value) => {
@@ -26,7 +27,6 @@ const asArray = (value) => Array.isArray(value) ? value : [];
 // @desc Create a new problem
 const createProblem = async (req, res, next) => {
     try {
-        await connectDB();
         const {
             title, description, difficulty, marks,
             questionType, options, correctAnswer,
@@ -130,7 +130,6 @@ const createProblem = async (req, res, next) => {
 // @desc Update an existing problem
 const updateProblem = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
         const {
             title, description, difficulty, marks,
@@ -240,7 +239,6 @@ const updateProblem = async (req, res, next) => {
 // @desc Get problem details
 const getProblemDetail = async (req, res, next) => {
     try {
-        await connectDB();
         const question = await Question.findById(req.params.id);
         if (!question) return res.status(404).json({ success: false, error: 'Question not found' });
 
@@ -253,7 +251,6 @@ const getProblemDetail = async (req, res, next) => {
 // @desc Delete a problem
 const deleteQuestion = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
         // Tests hold their own copies, so deleting from the bank can't touch them.
@@ -275,12 +272,8 @@ const deleteQuestion = async (req, res, next) => {
 // documents where the field is absent.
 // A late joiner's personal deadline can run past endTime, so a contest counts as
 // running until the last possible deadline.
-const isContestRunning = (contest, now) => {
-    const lastPossibleDeadline = new Date(new Date(contest.endTime).getTime() + (contest.durationMinutes || 0) * 60000);
-    return now >= new Date(contest.startTime) && now <= lastPossibleDeadline;
-};
+const isContestRunning = (contest, now) => now >= new Date(contest.startTime) && now <= lastDeadline(contest);
 
-const ENDED_STATUSES = ['completed', 'ended'];
 const statusQuery = (status, now) => ({
     completed: { $or: [{ status: { $in: ENDED_STATUSES } }, { status: { $nin: ENDED_STATUSES }, endTime: { $lt: now } }] },
     ongoing: { status: { $nin: ENDED_STATUSES }, startTime: { $lte: now }, endTime: { $gte: now } },
@@ -290,7 +283,6 @@ const statusQuery = (status, now) => ({
 // @desc Get all contests for admin dashboard
 const getAdminContests = async (req, res, next) => {
     try {
-        await connectDB();
         const now = new Date();
 
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -345,9 +337,6 @@ const getAdminContests = async (req, res, next) => {
         });
 
         const summary = contests.map(c => {
-            const start = new Date(c.startTime);
-            const end = new Date(c.endTime);
-
             const totalMinutes = c.durationMinutes || 0;
             const hours = Math.floor(totalMinutes / 60);
             const minutes = totalMinutes % 60;
@@ -360,27 +349,12 @@ const getAdminContests = async (req, res, next) => {
             const { total = 0, completed = 0 } = countsByContest[c._id.toString()] || {};
             const ongoing = total - completed;
 
-            // Compute Status Dynamically, unless manually ended/completed via the admin panel
-            let computedStatus = 'waiting';
-            const contestStatus = (c.status || '').toLowerCase();
-            const isManuallyEnded = contestStatus === 'completed' || contestStatus === 'ended';
-
-            if (isManuallyEnded) {
-                computedStatus = 'completed';
-            } else {
-                if (now > end) {
-                    computedStatus = 'completed';
-                } else if (now >= start && now <= end) {
-                    computedStatus = 'ongoing';
-                }
-            }
-
             return {
                 id: c._id,
                 title: c.title,
                 description: c.description,
                 createdAt: c.createdAt,
-                status: computedStatus,
+                status: contestStatus(c, now),
                 participants: total,
                 participantsCompleted: completed,
                 participantsInProgress: ongoing,
@@ -401,8 +375,7 @@ const getAdminContests = async (req, res, next) => {
 // @desc Create a new contest
 const createContest = async (req, res, next) => {
     try {
-        await connectDB();
-        const { title, description, duration, durationMinutes, problemIds, rules, author } = req.body;
+        const { title, description, duration, durationMinutes, problemIds, rules, author, shuffleQuestions } = req.body;
 
         if (!isNonEmptyString(title)) {
             return res.status(400).json({ success: false, error: 'Title is required' });
@@ -450,6 +423,7 @@ const createContest = async (req, res, next) => {
                     durationMinutes: durationMinutesNum,
                     questions,
                     rules,
+                    shuffleQuestions: Boolean(shuffleQuestions),
                     joinId,
                     author: author || "Admin"
                 });
@@ -470,7 +444,6 @@ const createContest = async (req, res, next) => {
 // @desc Clone an existing contest
 const cloneContest = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
         const originalContest = await Contest.findById(id).lean();
@@ -495,6 +468,7 @@ const cloneContest = async (req, res, next) => {
                     durationMinutes: originalContest.durationMinutes,
                     questions: originalContest.questions,
                     rules: originalContest.rules,
+                    shuffleQuestions: originalContest.shuffleQuestions,
                     joinId,
                     author: originalContest.author || "Admin"
                 });
@@ -515,9 +489,8 @@ const cloneContest = async (req, res, next) => {
 // @desc Update an existing contest
 const updateContest = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
-        const { title, description, duration, durationMinutes, problemIds, rules, visibility } = req.body;
+        const { title, description, duration, durationMinutes, problemIds, rules, visibility, shuffleQuestions } = req.body;
 
         const existingContest = await Contest.findById(id).select('startTime endTime durationMinutes questions').lean();
         if (!existingContest) return res.status(404).json({ success: false, error: 'Contest not found' });
@@ -543,6 +516,7 @@ const updateContest = async (req, res, next) => {
         }
 
         const updates = { title, description, rules, visibility };
+        if (shuffleQuestions !== undefined) updates.shuffleQuestions = Boolean(shuffleQuestions);
         if (durationMinutesNum !== undefined) {
             updates.durationMinutes = durationMinutesNum;
         }
@@ -599,7 +573,6 @@ const updateContest = async (req, res, next) => {
 // @desc End a contest: blocks new joins/starts, lets in-progress candidates finish
 const endContest = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
         const contest = await Contest.findByIdAndUpdate(id, { status: 'ended' }, { returnDocument: 'after' });
@@ -614,7 +587,6 @@ const endContest = async (req, res, next) => {
 // @desc Force-end a contest: also immediately submits every in-progress candidate
 const forceEndContest = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
         const contest = await Contest.findByIdAndUpdate(id, { status: 'ended' }, { returnDocument: 'after' });
@@ -642,7 +614,6 @@ const forceEndContest = async (req, res, next) => {
 // @desc Get contest results
 const getAdminContestResults = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
         const pageRaw = typeof req.query.page === 'string' ? req.query.page : '';
@@ -655,6 +626,8 @@ const getAdminContestResults = async (req, res, next) => {
         if (!contest) {
             return res.status(404).json({ success: false, error: 'Contest not found' });
         }
+        // Results must count candidates whose time ran out without a submit.
+        await finalizeExpiredAttempts(contest);
 
         const maxScore = (contest.questions || []).reduce((sum, q) => sum + (q.marks || 0), 0);
         const scoreFilterMeaningful = maxScore > 0;
@@ -798,15 +771,10 @@ const getAdminContestResults = async (req, res, next) => {
 // @desc Delete a contest
 const deleteContest = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
 
         const contest = await Contest.findById(id).select('status startTime endTime durationMinutes').lean();
         if (!contest) return res.status(404).json({ success: false, error: 'Contest not found' });
-
-        if (contest.status === 'ongoing') {
-            return res.status(400).json({ success: false, error: 'Cannot delete an ongoing contest' });
-        }
 
         if (isContestRunning(contest, new Date())) {
             return res.status(400).json({ success: false, error: 'Cannot delete a contest that is currently active (Time-based protection).' });
@@ -826,7 +794,6 @@ const deleteContest = async (req, res, next) => {
 // @desc Get admin dashboard statistics
 const getAdminStats = async (req, res, next) => {
     try {
-        await connectDB();
         const now = new Date();
 
         const [
@@ -898,7 +865,6 @@ const getAdminStats = async (req, res, next) => {
 // @desc Export a single question or multiple questions as JSON
 const exportQuestion = async (req, res, next) => {
     try {
-        await connectDB();
         const { id } = req.params;
         const { bulk } = req.query; // ?bulk=true to export multiple
 
@@ -948,7 +914,6 @@ const exportQuestion = async (req, res, next) => {
 // @desc Import questions from JSON
 const importQuestions = async (req, res, next) => {
     try {
-        await connectDB();
 
         if (!req.file) {
             return res.status(400).json({ success: false, error: 'No file uploaded' });

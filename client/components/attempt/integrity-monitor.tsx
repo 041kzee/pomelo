@@ -128,13 +128,13 @@ export default function IntegrityMonitor() {
       forced: true,
       autoSubmitReason: AUTO_SUBMIT_REASON,
       replace: true,
-      successMessage: "Test submitted after 3 violations.",
+      successMessage: `Test submitted after ${MAX_VIOLATIONS} violations.`,
       errorMessage: "Submission failed. Try again to finish the test.",
     });
 
     if (!result.success) {
       isAutoSubmittingRef.current = false;
-      setSubmissionError("The test is locked after 3 violations. Try submitting again.");
+      setSubmissionError(`The test is locked after ${MAX_VIOLATIONS} violations. Try submitting again.`);
     }
   }, [completeTest]);
 

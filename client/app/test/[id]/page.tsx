@@ -7,7 +7,7 @@ import { toast } from "@/components/ui/banner";
 import { AlertCircle, Calendar, Hourglass, CalendarX2, ListChecks, CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getContestLanding, startTest, getContestData } from "@/actions/contest";
-import { clearAttemptIntegrityState } from "@/lib/attempt-integrity";
+import { clearAttemptStorage } from "@/lib/attempt-integrity";
 
 interface ContestDetails {
   title: string;
@@ -70,7 +70,7 @@ export default function ContestLanding() {
         if (result.isCompleted) {
           setAlreadyCompleted(true);
         } else {
-          toast.error(result.message || "Failed to fetch data");
+          toast.error(result.error || "Failed to fetch data");
         }
       }
     } catch {
@@ -143,31 +143,23 @@ export default function ContestLanding() {
         }
       }
 
-      // Clear any old violation counts and code drafts from a previous attempt
-      clearAttemptIntegrityState(testid as string);
-      try {
-        Object.keys(localStorage).forEach(key => {
-          if (key.startsWith("pomelo_draft_")) {
-            localStorage.removeItem(key);
-          }
-        });
-      } catch {}
-
       const result = await startTest(testid as string);
 
       if (result.success) {
+        // A fresh attempt starts clean; a resumed one keeps its violations and drafts.
+        if (!result.data?.resumed) clearAttemptStorage(testid as string);
         // Fetch problems to redirect to the first one
         const questionsData = await getContestData(testid as string);
         if (questionsData.success && questionsData.data.problems?.length > 0) {
           router.push(`/attempt/test/${testid}/question/${questionsData.data.problems[0].id}`);
         } else {
-          router.push(`/attempt/test/${testid}/session`); // fallback
+          toast.error(questionsData.error || "Could not load the test questions");
         }
       } else {
         if (result.isCompleted) {
           setAlreadyCompleted(true);
         } else {
-          toast.error(result.error || result.message || "Failed to start session");
+          toast.error(result.error || "Failed to start session");
         }
         if (document.fullscreenElement && document.exitFullscreen) {
           try {

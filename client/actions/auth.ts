@@ -1,9 +1,11 @@
 "use server";
 
 import { signIn } from "@/auth";
-import { AuthError } from "next-auth";
+import { AuthError, CredentialsSignin } from "next-auth";
+import { LOGIN_RATE_LIMITED, LOGIN_UNAVAILABLE } from "@/lib/auth/providers/credentials";
 import { z } from "zod";
 import { getBaseUrl } from "@/lib/env";
+import { clientIpHeaders } from "@/lib/client-ip";
 
 const RegisterSchema = z.object({
     name: z.string().min(1).max(100),
@@ -22,8 +24,12 @@ export async function authenticate(prevState: string | undefined, formData: Form
     } catch (error) {
         if (error instanceof AuthError) {
             switch (error.type) {
-                case "CredentialsSignin":
+                case "CredentialsSignin": {
+                    const { code } = error as CredentialsSignin;
+                    if (code === LOGIN_RATE_LIMITED) return "Too many sign-in attempts. Please wait a minute and try again.";
+                    if (code === LOGIN_UNAVAILABLE) return "The server is busy or unreachable. Please try again in a moment.";
                     return "Invalid credentials.";
+                }
                 default:
                     return "Something went wrong.";
             }
@@ -44,14 +50,14 @@ export async function register(prevState: string | undefined, formData: FormData
     try {
         const res = await fetch(`${getBaseUrl()}/api/auth/register`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...(await clientIpHeaders()) },
             body: JSON.stringify({ name, email, password })
         });
 
         const data = await res.json();
 
         if (!res.ok || !data.success) {
-            return data.message || "Registration failed";
+            return data.error || "Registration failed";
         }
 
         return "success";
